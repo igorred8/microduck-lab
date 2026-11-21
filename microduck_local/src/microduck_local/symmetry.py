@@ -456,6 +456,21 @@ class SymmetryPPO(PPO):
         """The action distribution's MEAN (not a sample) for ``obs``."""
         return self.policy.get_distribution(obs).distribution.mean
 
+    def _mirror_observation(self, obs: torch.Tensor) -> torch.Tensor:
+        """Body-specific reflection hook; Microduck uses the contract map."""
+        return mirror_obs(obs)
+
+    def _mirror_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Body-specific action reflection hook."""
+        return mirror_action(action)
+
+    def _mirrored_observation(self, obs: torch.Tensor, norm) -> torch.Tensor:
+        if norm is None:
+            return self._mirror_observation(obs)
+        mean, std = norm
+        # Mirror in RAW observation space, then use the statistics in force.
+        return (self._mirror_observation(obs * std + mean) - mean) / std
+
     def _evaluate_actions(self, obs: torch.Tensor, actions: torch.Tensor):
         """``policy.evaluate_actions`` plus the action mean, one feature extract.
 
@@ -477,14 +492,31 @@ class SymmetryPPO(PPO):
         return (values, distribution.log_prob(actions), distribution.entropy(),
                 distribution.distribution.mean)
 
+    def _uses_action_mean(self) -> bool:
+        """Whether train() needs the actor mean beyond the mirror loss.
+
+        Body-specific auxiliary actor regularizers can opt in here. The stock
+        path stays bit-identical when neither symmetry nor such a term is on.
+        """
+        return False
+
+    def _policy_aux_losses(self, mean_orig: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Weighted actor-only losses, keyed by their train/ log suffix."""
+        return {}
+
+    def _policy_aux_metrics(self, mean_orig: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Detached actor diagnostics, keyed by their train/ log suffix.
+
+        These are especially important for stochastic PPO: environment ctrl
+        metrics describe sampled actions, whereas this hook sees the actor mean.
+        """
+        return {}
+
     def _symmetry_loss(
         self, obs: torch.Tensor, norm: tuple[torch.Tensor, torch.Tensor] | None,
         mean_orig: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        mirrored = (
-            mirror_obs(obs) if norm is None
-            else mirror_normalized_obs(obs, norm[0], norm[1])
-        )
+        mirrored = self._mirrored_observation(obs, norm)
         if mean_orig is None:
             # Tests and the standalone call: one forward over [o ; M o], as
             # rsl_rl does. The train() hot path passes mean_orig so it does
@@ -494,7 +526,7 @@ class SymmetryPPO(PPO):
             mean_orig, mean_mirrored_obs = both[:n], both[n:]
         else:
             mean_mirrored_obs = self._policy_mean(mirrored)
-        target = mirror_action(mean_orig).detach()
+        target = self._mirror_action(mean_orig).detach()
         return F.mse_loss(mean_mirrored_obs, target)
 
     # -- vendored SB3 2.9.0 PPO.train() + the symmetry term -----------------
@@ -556,6 +588,7 @@ class SymmetryPPO(PPO):
 
         # --- symmetry: snapshot the obs normalizer once per update ---
         use_symmetry = self.symmetry_coef > 0.0
+        use_action_mean = use_symmetry or self._uses_action_mean()
         # The normalizer is needed by the mirror LOSS and by augmentation:
         # both mirror observations, and the mirror is defined on RAW ones.
         norm = (self._obs_normalizer()
@@ -563,6 +596,8 @@ class SymmetryPPO(PPO):
         if update_dev is not None and norm is not None:
             norm = (norm[0].to(update_dev), norm[1].to(update_dev))
         symmetry_losses: list[float] = []
+        aux_losses: dict[str, list[float]] = {}
+        aux_metrics: dict[str, list[float]] = {}
 
         entropy_losses = []
         pg_losses, value_losses = [], []
@@ -602,13 +637,14 @@ class SymmetryPPO(PPO):
                     # probability, so those carry over. The old policy is only
                     # approximately equivariant, which is the bias this mode
                     # trades for the extra samples.
-                    m_obs = (mirror_obs(rollout_data.observations) if norm is None
-                             else mirror_normalized_obs(rollout_data.observations,
-                                                        norm[0], norm[1]))
+                    m_obs = self._mirrored_observation(
+                        rollout_data.observations, norm)
                     rollout_data = type(rollout_data)(
                         observations=torch.cat([rollout_data.observations, m_obs], 0),
-                        actions=torch.cat([rollout_data.actions,
-                                           mirror_action(rollout_data.actions)], 0),
+                        actions=torch.cat([
+                            rollout_data.actions,
+                            self._mirror_action(rollout_data.actions),
+                        ], 0),
                         old_values=torch.cat([rollout_data.old_values] * 2, 0),
                         old_log_prob=torch.cat([rollout_data.old_log_prob] * 2, 0),
                         advantages=torch.cat([rollout_data.advantages] * 2, 0),
@@ -618,14 +654,14 @@ class SymmetryPPO(PPO):
                     if isinstance(self.action_space, spaces.Discrete):
                         actions = rollout_data.actions.long().flatten()
 
-                if use_symmetry:
+                if use_action_mean:
                     values, log_prob, entropy, mean_orig = self._evaluate_actions(
                         rollout_data.observations, actions
                     )
                 else:
-                    # Zero-coef path must call evaluate_actions, not our
-                    # helper: test_zero_coef_is_bit_identical_to_stock_ppo
-                    # compares weights against stock PPO.train().
+                    # Zero-aux path must call evaluate_actions, not our helper:
+                    # test_zero_coef_is_bit_identical_to_stock_ppo compares
+                    # weights against stock PPO.train().
                     values, log_prob, entropy = self.policy.evaluate_actions(
                         rollout_data.observations, actions
                     )
@@ -671,6 +707,12 @@ class SymmetryPPO(PPO):
                         rollout_data.observations, norm, mean_orig=mean_orig
                     )
                     loss = loss + self.symmetry_coef * symmetry_loss
+                if use_action_mean:
+                    for name, aux_loss in self._policy_aux_losses(mean_orig).items():
+                        loss = loss + aux_loss
+                        aux_losses.setdefault(name, []).append(aux_loss.item())
+                    for name, metric in self._policy_aux_metrics(mean_orig).items():
+                        aux_metrics.setdefault(name, []).append(metric.item())
 
                 if need_kl:
                     # Calculate approximate form of reverse KL Divergence for
@@ -740,6 +782,10 @@ class SymmetryPPO(PPO):
         self.logger.record("train/explained_variance", explained_var)
         if symmetry_losses:
             self.logger.record("train/symmetry_loss", np.mean(symmetry_losses))
+        for name, values in aux_losses.items():
+            self.logger.record(f"train/{name}_loss", np.mean(values))
+        for name, values in aux_metrics.items():
+            self.logger.record(f"train/{name}", np.mean(values))
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
 

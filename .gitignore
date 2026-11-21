@@ -68,3 +68,9 @@ duck-viewer/viewer-server.log
 # MuJoCo writes this beside whatever process loaded a model (compile
 # warnings from the G1 attach); it is a runtime log, not source.
 MUJOCO_LOG.TXT
+
+# Local backups and runtime state (session artifacts, not source)
+/backups/
+microduck_local/lab-state-*.json
+microduck_local/meshes/
+microduck_local/models/

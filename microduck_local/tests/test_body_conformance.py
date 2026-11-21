@@ -1163,7 +1163,7 @@ def test_a_random_weight_policy_round_trips_through_the_exporter(robot, tmp_path
     with open(run / "vecnormalize.pkl", "rb") as f:
         vn = pickle.load(f)
     wrapper = OnnxWalkPolicy(loaded.policy, vn.obs_rms.mean, vn.obs_rms.var,
-                             vn.clip_obs).eval()
+                             vn.clip_obs, contract_id=spec.contract().id).eval()
     rng = np.random.default_rng(0)
     for _ in range(3):
         obs = rng.normal(0, 1, (1, spec.obs_dim)).astype(np.float32)

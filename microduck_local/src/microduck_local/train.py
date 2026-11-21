@@ -115,12 +115,13 @@ def _watch_callback_cls(BaseCallback):
 
     class WatchCallback(BaseCallback):
         def __init__(self, out, total_steps: int, snap_steps: int, obs_dim: int,
-                     start_steps: int = 0):
+                     start_steps: int = 0, contract_id: str | None = None):
             super().__init__()
             self.out = Path(out)
             self.total_steps = int(total_steps)
             self.snap_steps = int(snap_steps)
             self.obs_dim = int(obs_dim)
+            self.contract_id = contract_id
             # Anchor to the warm-start count, like train_behavior's
             # ProgressCallback. `model.num_timesteps` CONTINUES from the
             # loaded checkpoint when reset_num_timesteps is False, so a bare
@@ -135,6 +136,9 @@ def _watch_callback_cls(BaseCallback):
             self.ep_rews: list[float] = []
             self.term_sums: dict[str, float] = {}
             self.term_eps = 0
+            self.metric_sums: dict[str, float] = {}
+            self.metric_samples = 0
+            self._last_metrics: dict[str, float] = {}
             self.t0 = self._prev_t = time.time()
             self._prev_steps = self.start_steps
             self._last_terms: dict[str, float] = {}
@@ -150,6 +154,12 @@ def _watch_callback_cls(BaseCallback):
                     for k, v in sums.items():
                         self.term_sums[k] = self.term_sums.get(k, 0.0) + float(v)
                     self.term_eps += 1
+                metrics = info.get("momduck_metrics")
+                if metrics:
+                    for k, v in metrics.items():
+                        self.metric_sums[k] = (
+                            self.metric_sums.get(k, 0.0) + float(v))
+                    self.metric_samples += 1
             return True
 
         def _on_rollout_end(self) -> None:
@@ -157,6 +167,14 @@ def _watch_callback_cls(BaseCallback):
                      if self.term_eps else dict(self._last_terms))
             if self.term_eps:
                 self._last_terms = terms
+            metrics = {
+                k: round(v / max(self.metric_samples, 1), 5)
+                for k, v in self.metric_sums.items()
+            }
+            if metrics:
+                self._last_metrics = metrics
+            else:
+                metrics = self._last_metrics
             now = time.time()
             dt, ds = now - self._prev_t, int(self.num_timesteps) - self._prev_steps
             self._prev_t, self._prev_steps = now, int(self.num_timesteps)
@@ -170,10 +188,25 @@ def _watch_callback_cls(BaseCallback):
                 "elapsed_s": round(now - self.t0, 1),
                 "sps": round(ds / dt) if dt > 0 else 0,
             }
+            if metrics:
+                line["metrics"] = metrics
+            # Environment metrics above come from SAMPLED exploration actions.
+            # Keep the deterministic actor-mean diagnostics in their own block:
+            # these are the targets exported to ONNX, not another ctrl average.
+            logger = getattr(self.model, "logger", None)
+            logged = getattr(logger, "name_to_value", {})
+            actor = {
+                name.removeprefix("train/"): round(float(value), 5)
+                for name, value in logged.items()
+                if name.startswith("train/actor_")
+            }
+            if actor:
+                line["actor"] = actor
             with open(self.out / "progress.jsonl", "a") as f:
                 f.write(json.dumps(line) + "\n")
             self.ep_lens, self.ep_rews = [], []
             self.term_sums, self.term_eps = {}, 0
+            self.metric_sums, self.metric_samples = {}, 0
             if self.num_timesteps >= self.next_snap:
                 self._snapshot()
                 self.next_snap += self.snap_steps
@@ -186,7 +219,8 @@ def _watch_callback_cls(BaseCallback):
             from .export_onnx import OnnxWalkPolicy
             venv = self.model.get_vec_normalize_env()
             wrapper = OnnxWalkPolicy(self.model.policy, venv.obs_rms.mean,
-                                     venv.obs_rms.var, venv.clip_obs).eval()
+                                     venv.obs_rms.var, venv.clip_obs,
+                                     contract_id=self.contract_id).eval()
             tmp = self.out / "live.onnx.tmp"
             dummy = torch.zeros(1, self.obs_dim, dtype=torch.float32)
             torch.onnx.export(wrapper, (dummy,), str(tmp), input_names=["obs"],
@@ -282,6 +316,62 @@ def make_env(rank: int, seed: int, robot: str = "microduck",
     def _init():
         return cls(seed=seed + rank, **env_kwargs)
     return _init
+
+
+def ppo_class_and_kwargs(robot: str):
+    """PPO implementation and constructor/load overrides for this body.
+
+    Kept behind a function so module import still does not import torch before
+    the vector workers fork. Momduck reflects across YZ rather than Microduck's
+    XZ plane, so using the stock contract mirror would train the wrong prior.
+    """
+    if robot == "momduck":
+        from .robots.momduck_symmetry import (
+            MOMDUCK_HIP_YAW_ACTION_COEF,
+            MOMDUCK_HIP_YAW_ACTION_LIMIT_DEG,
+            MOMDUCK_HIP_YAW_ACTION_RAMP,
+            MOMDUCK_SYMMETRY_COEF,
+            MomduckSymmetryPPO,
+        )
+        return MomduckSymmetryPPO, {
+            "symmetry_coef": MOMDUCK_SYMMETRY_COEF,
+            "hip_yaw_action_coef": MOMDUCK_HIP_YAW_ACTION_COEF,
+            "hip_yaw_action_ramp": MOMDUCK_HIP_YAW_ACTION_RAMP,
+            "hip_yaw_action_limit_deg": MOMDUCK_HIP_YAW_ACTION_LIMIT_DEG,
+        }
+    from stable_baselines3 import PPO
+    return PPO, {}
+
+
+def _set_fresh_exploration_std(model, robot: str) -> None:
+    """Keep fresh Momduck yaw exploration informative inside its hard bound."""
+    if robot != "momduck":
+        return
+    import math
+
+    import torch
+
+    from .robots.momduck import HIP_YAW_ACTION_IDS, HIP_YAW_EXPLORATION_STD_DEG
+
+    # Scalar log_std_init=0 would explore yaw with std 1 rad (57 deg), driving
+    # most samples into the +/-10 deg bound. Raw actions remain in radians;
+    # only these two initial standard deviations change. Donors keep their std.
+    with torch.no_grad():
+        model.policy.log_std.data[list(HIP_YAW_ACTION_IDS)] = math.log(
+            math.radians(HIP_YAW_EXPLORATION_STD_DEG))
+
+
+def ppo_run_metadata(model) -> dict:
+    """Record the mirror prior actually active on the constructed model."""
+    return {
+        "ppo_class": type(model).__name__,
+        "symmetry_coef": float(getattr(model, "symmetry_coef", 0.0)),
+        "symmetry_augment": bool(getattr(model, "symmetry_augment", False)),
+        "hip_yaw_action_coef": float(getattr(model, "hip_yaw_action_coef", 0.0)),
+        "hip_yaw_action_ramp": float(getattr(model, "hip_yaw_action_ramp", 0.0)),
+        "hip_yaw_action_limit_deg": float(
+            getattr(model, "hip_yaw_action_limit_deg", 0.0)),
+    }
 
 
 # The actuator train-walk trains on when neither --actuator nor
@@ -422,7 +512,6 @@ def main() -> None:
                          for i in range(args.envs)])
 
     import torch
-    from stable_baselines3 import PPO
     from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
     from stable_baselines3.common.vec_env.vec_monitor import VecMonitor
     from stable_baselines3.common.vec_env.vec_normalize import VecNormalize
@@ -432,6 +521,8 @@ def main() -> None:
     batch = ppo_batch_size(N_STEPS, args.envs)
 
     from .symmetry import FastActorCriticPolicy
+
+    ppo_cls, ppo_kwargs = ppo_class_and_kwargs(args.robot)
 
     if args.init_from:
         prev = Path(args.init_from)
@@ -490,14 +581,25 @@ def main() -> None:
             body = _spec_mod.get(args.robot)
             if hasattr(body, "twist_obs_slice"):
                 _pass_through_command_dims(venv, body)
-        model = PPO.load(str(prev / "model"), env=venv, device=args.device,
-                         custom_objects={"policy_class": FastActorCriticPolicy})
+        model = ppo_cls.load(
+            str(prev / "model"), env=venv, device=args.device,
+            custom_objects={"policy_class": FastActorCriticPolicy},
+            **ppo_kwargs,
+        )
         # Warm starts INHERIT log_std, so a chain ratchets it up run after run
         # until the exported mean no longer carries the skill. Bind the cap on
         # load, not only per rollout.
         import torch as _torch
         with _torch.no_grad():
             model.policy.log_std.data.clamp_(max=LOG_STD_MAX)
+        # The pickled logger still points at the DONOR's tb dir (the fresh-run
+        # tensorboard_log below never reaches the load path), so a whole
+        # warm-start chain appends to the root run's events — and the trainer
+        # DIES with FileNotFoundError the day that dir is moved or deleted.
+        # Measured 2026-11-21: cleaning an old run's dir killed its descendant
+        # mid-training. Point the logger at THIS run's tb dir instead.
+        from stable_baselines3.common.logger import configure as _configure
+        model.set_logger(_configure(str(out / "tb"), ["tensorboard"]))
         model.batch_size = batch
         # A warm start polishes; it does not explore from nothing. The flat
         # 1e-3 that trains a policy from scratch wrecks a cloned one.
@@ -507,7 +609,7 @@ def main() -> None:
         print(f"warm-started from {prev} (lr {lr:g})")
     else:
         venv = VecNormalize(venv, norm_obs=True, norm_reward=False, clip_obs=100.0)
-        model = PPO(
+        model = ppo_cls(
             FastActorCriticPolicy, venv,
             # rsl_rl-flavored: big-ish MLP, ELU, PPO with standard locomotion params.
             policy_kwargs=dict(
@@ -526,7 +628,9 @@ def main() -> None:
             max_grad_norm=1.0,
             device=args.device, seed=args.seed, verbose=1,
             tensorboard_log=str(out / "tb"),
+            **ppo_kwargs,
         )
+        _set_fresh_exploration_std(model, args.robot)
 
     try:
         git_sha = subprocess.run(
@@ -546,10 +650,13 @@ def main() -> None:
         # its own export against, and the one that answers for a checkpoint
         # ONNX that was never stamped.
         "contract": _body(args.robot).contract().as_dict(),
+        "action_contract": getattr(
+            _body(args.robot), "action_metadata", lambda: {})(),
         "task": args.task,
         "pinned_command": is_pinned_command(args.task),
         "seed": args.seed, "env_kwargs": env_kwargs,
         "microduck_rl_sha": git_sha, "init_from": args.init_from,
+        **ppo_run_metadata(model),
     }
     (out / "run.json").write_text(json.dumps(run_meta, indent=2))
     # ...and the record a PERSON reads (run_record.py). Written before the
@@ -565,7 +672,7 @@ def main() -> None:
         stage_env=stage_env))
 
     checkpoints = CheckpointCallback(
-        save_freq=max(500_000 // args.envs, 1), save_path=str(out / "checkpoints"),
+        save_freq=max(200_000 // args.envs, 1), save_path=str(out / "checkpoints"),
         name_prefix="model", save_vecnormalize=True,
     )
     # On Linux/cloud `with_phase_callbacks` appends the profile's thread
@@ -575,6 +682,9 @@ def main() -> None:
     from .robots import spec as _spec
     callbacks = [checkpoints, _penalty_sign_callback_cls(BaseCallback)(),
                  _log_std_cap_callback_cls(BaseCallback)()]
+    if args.robot == "momduck" and args.task == "run":
+        from .robots.momduck_curriculum import MomduckRunCurriculum
+        callbacks.append(MomduckRunCurriculum(out))
     if args.snap_steps > 0:
         # Makes the run WATCHABLE: the lab tails progress.jsonl for the card
         # and loads live.onnx onto the 🎓 trainee as it improves.
@@ -589,7 +699,8 @@ def main() -> None:
             int(getattr(model.observation_space, "shape",
                         (_spec.get(args.robot).obs_dim,))[0]),
             # SB3 keeps the loaded count when reset_num_timesteps is False.
-            start_steps=int(model.num_timesteps) if args.init_from else 0))
+            start_steps=int(model.num_timesteps) if args.init_from else 0,
+            contract_id=_spec.get(args.robot).contract().id))
     model.learn(
         total_timesteps=args.steps,
         callback=with_phase_callbacks(callbacks, BaseCallback),

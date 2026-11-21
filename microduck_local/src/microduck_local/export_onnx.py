@@ -72,7 +72,8 @@ DEAD_OBS_VAR = 1e-8
 
 
 class OnnxWalkPolicy(torch.nn.Module):
-    def __init__(self, policy, obs_mean: np.ndarray, obs_var: np.ndarray, clip_obs: float):
+    def __init__(self, policy, obs_mean: np.ndarray, obs_var: np.ndarray,
+                 clip_obs: float, contract_id: str | None = None):
         super().__init__()
         self.policy = policy
         mean, var = np.asarray(obs_mean).copy(), np.asarray(obs_var).copy()
@@ -81,12 +82,32 @@ class OnnxWalkPolicy(torch.nn.Module):
         self.register_buffer("obs_mean", torch.tensor(mean, dtype=torch.float32))
         self.register_buffer("obs_std", torch.tensor(np.sqrt(var + 1e-8), dtype=torch.float32))
         self.clip_obs = clip_obs
+        self.hip_yaw_limit = None
+        self.register_buffer("hip_yaw_mask", None)
+        if contract_id == "momduck-61-v2":
+            from .robots.momduck import (
+                HIP_YAW_ACTION_IDS,
+                HIP_YAW_TARGET_LIMIT_RAD,
+            )
+            mask = torch.zeros(int(policy.action_space.shape[0]), dtype=torch.bool)
+            mask[list(HIP_YAW_ACTION_IDS)] = True
+            self.register_buffer("hip_yaw_mask", mask)
+            self.hip_yaw_limit = HIP_YAW_TARGET_LIMIT_RAD
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         x = torch.clamp((obs - self.obs_mean) / self.obs_std, -self.clip_obs, self.clip_obs)
         features = self.policy.extract_features(x, self.policy.features_extractor)
         latent_pi = self.policy.mlp_extractor.forward_actor(features)
-        return self.policy.action_net(latent_pi)  # deterministic mean action
+        action = self.policy.action_net(latent_pi)  # deterministic mean action
+        if self.hip_yaw_mask is not None:
+            # Same idempotent bound as MomduckBody.process_action(). Reapplying
+            # it in the walking env is therefore exact, not a second scaling.
+            action = torch.where(
+                self.hip_yaw_mask,
+                torch.clamp(action, -self.hip_yaw_limit, self.hip_yaw_limit),
+                action,
+            )
+        return action
 
 
 def export_contract(run_dir: Path, robot: str | None = None) -> PolicyContract:
@@ -148,15 +169,18 @@ def export(run_dir: Path, out_path: Path, model_path: Path | None = None,
     with open(vn_path or (run_dir / "vecnormalize.pkl"), "rb") as f:
         vn: VecNormalize = pickle.load(f)
 
+    # Resolve the contract before constructing the wrapper: v2 also determines
+    # the deterministic action semantics baked into the graph.
+    contract = export_contract(run_dir, robot)
     wrapper = OnnxWalkPolicy(
-        model.policy, vn.obs_rms.mean, vn.obs_rms.var, vn.clip_obs
+        model.policy, vn.obs_rms.mean, vn.obs_rms.var, vn.clip_obs,
+        contract_id=contract.id,
     ).eval()
 
     # Dimensions come from the ROBOT this run trained on, and are then
     # cross-checked against the checkpoint itself: a mismatch here means the
     # run.json and the weights disagree, and exporting the wrong shape would
     # hand someone a policy that loads and does nothing sane.
-    contract = export_contract(run_dir, robot)
     obs_dim, act_dim = contract.obs_dim, contract.act_dim
     ckpt_obs = int(model.policy.observation_space.shape[0])
     ckpt_act = int(model.policy.action_space.shape[0])

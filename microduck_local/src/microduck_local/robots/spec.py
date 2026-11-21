@@ -135,8 +135,21 @@ class RobotSpec(BodyBase):
                 f"RobotSpec {self.id!r} has no scene_fn — the walking env "
                 "spawns from that scene's keyframe, so it is required")
 
+    def process_action(self, action: np.ndarray) -> np.ndarray:
+        """Bound/map the policy output before it is observed or applied.
+
+        Most bodies use the raw output unchanged. A body-specific transform
+        belongs here so training, `last_action`, and exported inference share
+        exactly the same action semantics.
+        """
+        return action
+
+    def action_metadata(self) -> dict:
+        """JSON-safe additions to run.json for a non-default action contract."""
+        return {}
+
     def scale_action(self, action: np.ndarray) -> np.ndarray:
-        """Policy output -> position target (radians)."""
+        """Processed policy output -> position target (radians)."""
         if self.action_scale is None:
             return self.default_pose + action
         return self.default_pose + action * self.action_scale

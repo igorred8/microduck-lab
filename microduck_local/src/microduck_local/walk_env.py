@@ -890,16 +890,13 @@ class MicroduckWalkEnv(gym.Env):
             # ~0.55 us: cheaper than a second 138 MB model, and the only thing
             # standing between sibling envs and each other's body mass.
             self._sync_model()
-        # last_action is the RAW policy output, NOT the clipped one — upstream
-        # never clips at all (clip_actions=None), so there the two are the same
-        # thing and the action-rate penalty prices whatever the network emits.
-        # Storing the clipped value here decoupled them and made unbounded
-        # output growth FREE: measured, a 25M-step policy reached a mean |a| of
-        # 29.0 (max 140.9) with 52% of outputs saturated against the +/-4 clip,
-        # while alpha_walking sits at 0.19 and never saturates. The env still
-        # clips what it APPLIES — the actuator has limits — but the reward and
-        # the observation now see what the policy actually asked for.
-        raw = np.asarray(action, np.float32)
+        # By default last_action is the RAW policy output, NOT the generic
+        # +/-4 safety clip: otherwise unbounded output growth becomes free.
+        # A body's explicit action contract (Momduck v2's +/-10 deg yaw bound)
+        # is applied BEFORE storage instead, so training observations and ONNX
+        # inference describe the same bounded action. The generic clip below
+        # still guards what reaches the actuator for every body.
+        raw = self.robot.process_action(np.asarray(action, np.float32))
         self.prev_action = self.last_action
         self.last_action = raw.copy()
         # ndarray.clip is the exact call np.clip dispatches to (fromnumeric's

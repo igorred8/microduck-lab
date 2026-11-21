@@ -719,8 +719,13 @@ def match_behavior(text: str, robot: str = "microduck") -> Behavior | None:
     imitation run is titled after its clip, `Perform “backflip”`, and
     scored as prose that text reaches the floor-roll recipe instead."""
     key = text.strip().lower()
-    if key in BEHAVIORS and BEHAVIORS[key].robot == (robot or "microduck"):
-        return BEHAVIORS[key]
+    if key in BEHAVIORS:
+        # A recipe id is an exact routing token, not prose for keyword scoring.
+        # In particular, another body's `momduck_run` must not fall through to
+        # this body's generic `run` recipe merely because it contains "run".
+        if BEHAVIORS[key].robot == (robot or "microduck"):
+            return BEHAVIORS[key]
+        return None
     t = " " + text.lower().replace("1", "one").strip() + " "
     best, best_score = None, 0.0
     for b in for_robot(robot):

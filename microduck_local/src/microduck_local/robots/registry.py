@@ -69,14 +69,14 @@ class _Builtin:
 _BUILTINS: tuple[_Builtin, ...] = (
     _Builtin(id="microduck", module="..contract", attr="MICRODUCK",
              setup_hint=""),
+    _Builtin(id="momduck", module=".momduck", attr="BODY",
+              setup_hint=""),        
     _Builtin(id="g1", module=".g1", attr="G1_SPEC",
              setup_hint="uv run fetch-robot g1"),
     _Builtin(id="mars", module=".mars", attr="MARS",
              setup_hint="uv run fetch-robot mars"),
     _Builtin(id="moss", module=".moss", attr="MOSS",
              setup_hint="uv run fetch-robot moss"),
-    _Builtin(id="asimov1", module=".asimov", attr="ASIMOV1",
-             setup_hint="uv run fetch-robot asimov1"),
 )
 
 #: Id namespaces whose bodies are DISCOVERED from a cache: `{prefix: module}`,
