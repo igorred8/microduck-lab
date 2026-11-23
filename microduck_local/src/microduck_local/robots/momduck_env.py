@@ -50,7 +50,49 @@ class MomduckWalkEnv(MicroduckWalkEnv):
     #: charged ONLY in double support — during a step the legs must differ,
     #: and charging the swing phase would tax the gait itself. Measured on
     #: 0fea9a: ankle ~29 deg, hip_pitch ~19 deg of left-right skew.
-    W_STANCE_SYMMETRY = 2.0
+    W_STANCE_SYMMETRY = 4.0
+    #: Long-stride / high-lift terms (2026-11-22, Jonathan: "мотивировать
+    #: длинные шаги, высоко поднимать ноги"). Paid only in single support,
+    #: capped — a bounded target, not a jackpot.
+    #: v5: stride is measured against the TRUNK projection, not the other
+    #: foot — paying foot-over-foot rewarded marching in place (measured on
+    #: 7e6a61: mean swing lead 0.5 cm while the body still crept forward by
+    #: passing over planted feet). Landing ahead of the body IS a visible
+    #: forward step. W_FORWARD_PROGRESS 2->3 for the same slow creep
+    #: (0.037 m/s against a 0.15 command).
+    W_STRIDE = 3.0
+    STRIDE_TARGET = 0.10       # m the swing foot lands AHEAD of the trunk
+    W_CLEARANCE = 3.0
+    CLEARANCE_TARGET = 0.04    # m of swing-foot lift over the stance sole
+    W_FORWARD_PROGRESS = 6.0
+    #: Dedicated hip_roll symmetry charge (Jonathan, 2026-11-22: "нужна
+    #: симметрия hip roll"). The generic stance_symmetry term covers the pair
+    #: at W4 among all five; hip_roll is the one the eye catches (measured
+    #: skew 3.1 deg at 7e6a61), so it gets its own stronger charge, same
+    #: double-support gate. Mirror sign for the pair is -1: a symmetric
+    #: stance has rel_left == -rel_right.
+    W_HIP_ROLL_SYM = 8.0
+    #: Same dedicated charge for hip_yaw (Jonathan, 2026-11-22: "есть явная
+    #: асимметрия hip yaw"). Measured in double support on e75952: both
+    #: sides ~-9 deg where symmetry needs -left == +right — an 18 deg skew
+    #: the generic stance term was not removing. Same sign (-1), same gate.
+    #: W8->24 (2026-11-22): a full 01d481 run at W8 left the penalty flat at
+    #: ~-25 for 200k+ steps — the skew is baked into the warm-started policy
+    #: and a ~0.4 % charge cannot pull it out. 24x the quadratic still prices
+    #: only ~-90, about 1.5 % of the economy.
+    W_HIP_YAW_SYM = 24.0
+    #: Path-straightness charge (Jonathan, 2026-11-22: e75952@15394k reaches
+    #: 0.25 m/s "но есть проблема с прямолинейностью"). The track_lin_vel
+    #: Gaussian has TRACK_STD2=0.1 — dead to a systematic 0.1 m/s sideways
+    #: creep or a slow 0.1 rad/s curvature, exactly the failure seen. This is
+    #: a plain quadratic on BOTH body-frame errors, so the gradient survives
+    #: at small errors. Yaw error is scaled 0.25 (rad/s vs m/s units). Only
+    #: when a motion command is active, so a stand command is not charged.
+    W_PATH_DRIFT = 8.0
+    #: REMOVED 2026-11-22: hip_pitch_rate and head_roll_penalty degraded the
+    #: gait TWICE — at W2 and at W0.5 (Jonathan stopped both runs; the second
+    #: collapse took foot lift 2.1 cm -> 0.3 cm). Nine simultaneous objectives
+    #: is past what one PPO can hold here; head_tilt already prices the head.
 
     #: Head-tilt charge: quadratic per degree beyond a 6 deg allowance.
     #: Total tilt of the head's z-axis from world up — covers the roll Jonathan
@@ -58,10 +100,14 @@ class MomduckWalkEnv(MicroduckWalkEnv):
     #: an axis-index trap (measured via the z-axis z-component, not xmat[5]).
     W_HEAD_TILT_PENALTY = 0.02
     HEAD_TILT_TOL_DEG = 6.0
-    #: Stance-width charge: quadratic per metre inside the 0.08 m band
-    #: (~68% of the measured STAND separation 0.117 m).
+    #: Stance-width charge, TWO-SIDED around the measured STAND separation
+    #: (0.117 m) with a 2 cm allowance — v1 penalised only narrowness, and
+    #: the policy happily splayed past the band ("ноги враскоряку", Jonathan
+    #: screenshot 2026-11-22): a one-sided floor with no ceiling is an
+    #: invitation to widen. Now deviation in EITHER direction is charged.
     W_FOOT_SEPARATION = 2000.0
-    FOOT_SEPARATION_MIN = 0.08
+    FOOT_SEPARATION_NOMINAL = 0.117
+    FOOT_SEPARATION_TOL = 0.02
 
     def __init__(self, *args, **kwargs):
         # Generic entry points instantiate BODY.env_class() without a `robot`
@@ -82,6 +128,14 @@ class MomduckWalkEnv(MicroduckWalkEnv):
         _p = np.asarray(momduck_mirror_action.perm)
         _s = np.asarray(momduck_mirror_action.sign)
         self._sym_pairs = [(i, int(_p[i]), float(_s[i])) for i in range(5)]
+        # Resolve the hip_roll pair BY NAME — index 1 today, but that is an
+        # accident of the action ordering, not a fact to code against.
+        _names = list(self._actuator_names())
+        _il = _names.index("left_hip_roll")
+        self._hip_roll_pair = (_il, int(_p[_il]), float(_s[_il]))
+        # Same by-name resolution for the hip_yaw pair (indices 0 and 9).
+        _iy = _names.index("left_hip_yaw")
+        self._hip_yaw_pair = (_iy, int(_p[_iy]), float(_s[_iy]))
 
     def _compute_reward(self):
         reward, terms = super()._compute_reward()
@@ -94,8 +148,8 @@ class MomduckWalkEnv(MicroduckWalkEnv):
         fl = self.data.geom_xpos[self.foot_geoms["left"]]
         fr = self.data.geom_xpos[self.foot_geoms["right"]]
         sep = float(np.linalg.norm(fl[:2] - fr[:2]))
-        narrow = max(0.0, self.FOOT_SEPARATION_MIN - sep)
-        terms["foot_separation_penalty"] = -self.W_FOOT_SEPARATION * narrow * narrow
+        off = abs(sep - self.FOOT_SEPARATION_NOMINAL) - self.FOOT_SEPARATION_TOL
+        terms["foot_separation_penalty"] = -self.W_FOOT_SEPARATION * max(0.0, off) ** 2
         reward += terms["head_tilt_penalty"] + terms["foot_separation_penalty"]
         # Directional terms: signed progress along the commanded body-frame
         # direction, and NO air-time payout while retreating from it. Without
@@ -113,8 +167,25 @@ class MomduckWalkEnv(MicroduckWalkEnv):
         else:
             terms["forward_progress"] = 0.0
         reward += terms["forward_progress"]
+        # Path straightness: plain quadratic on body-frame lateral velocity
+        # error and yaw-rate error against the command. The track Gaussian
+        # (TRACK_STD2=0.1) is dead at the 0.1 m/s / 0.1 rad/s systematic
+        # errors that make the duck curve off its line. Charged only under an
+        # active motion command, so standing episodes are not taxed.
+        if cmd_speed > 0.01:
+            v = self.body_lin_vel()
+            lat_err = float(v[1] - cmd[1])
+            yaw_err = float(self._gyro[2] - cmd[2])
+            terms["path_drift_penalty"] = -self.W_PATH_DRIFT * (
+                lat_err * lat_err + 0.25 * yaw_err * yaw_err)
+        else:
+            terms["path_drift_penalty"] = 0.0
+        reward += terms["path_drift_penalty"]
         # Stance symmetry: left-right skew from the mirrored pose, charged
         # only when BOTH feet are down — the swing phase must stay free.
+        # In single support the same frame pays the swing leg for covering
+        # ground (stride) and lifting (clearance), relative to the planted
+        # foot, along the body's forward axis.
         contacts = self._foot_contacts()
         if contacts["left"] and contacts["right"]:
             rel = self._joint_pos_rel()
@@ -123,9 +194,42 @@ class MomduckWalkEnv(MicroduckWalkEnv):
                 d = float(rel[i]) - s * float(rel[j])
                 skew += d * d
             terms["stance_symmetry_penalty"] = -self.W_STANCE_SYMMETRY * skew
+            il, jl, sl = self._hip_roll_pair
+            hr = float(rel[il]) - sl * float(rel[jl])
+            terms["hip_roll_symmetry_penalty"] = -self.W_HIP_ROLL_SYM * hr * hr
+            iy, jy, sy = self._hip_yaw_pair
+            hy = float(rel[iy]) - sy * float(rel[jy])
+            terms["hip_yaw_symmetry_penalty"] = -self.W_HIP_YAW_SYM * hy * hy
+            terms["stride_length"] = 0.0
+            terms["foot_clearance"] = 0.0
+        elif contacts["left"] != contacts["right"]:
+            terms["stance_symmetry_penalty"] = 0.0
+            terms["hip_roll_symmetry_penalty"] = 0.0
+            terms["hip_yaw_symmetry_penalty"] = 0.0
+            swing = "right" if contacts["left"] else "left"
+            stance = "left" if contacts["left"] else "right"
+            ps = self.data.geom_xpos[self.foot_geoms[swing]]
+            pst = self.data.geom_xpos[self.foot_geoms[stance]]
+            fwd = self._trunk_xmat.reshape(3, 3) @ self.BODY_FORWARD
+            fwd[2] = 0.0
+            norm = float(np.linalg.norm(fwd))
+            fwd = fwd / norm if norm > 1e-9 else np.array(self.BODY_FORWARD)
+            lead = float((ps[:2] - self._trunk_xpos[:2]) @ fwd[:2])
+            terms["stride_length"] = self.W_STRIDE * float(
+                np.clip(lead / self.STRIDE_TARGET, 0.0, 1.0))
+            lift = max(0.0, float(ps[2] - pst[2]))
+            terms["foot_clearance"] = self.W_CLEARANCE * float(
+                np.clip(lift / self.CLEARANCE_TARGET, 0.0, 1.0))
         else:
             terms["stance_symmetry_penalty"] = 0.0
-        reward += terms["stance_symmetry_penalty"]
+            terms["hip_roll_symmetry_penalty"] = 0.0
+            terms["hip_yaw_symmetry_penalty"] = 0.0
+            terms["stride_length"] = 0.0
+            terms["foot_clearance"] = 0.0
+        reward += (terms["stance_symmetry_penalty"]
+                   + terms["hip_roll_symmetry_penalty"]
+                   + terms["hip_yaw_symmetry_penalty"]
+                   + terms["stride_length"] + terms["foot_clearance"])
         return reward, terms
 
 

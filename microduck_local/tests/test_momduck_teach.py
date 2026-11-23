@@ -796,3 +796,95 @@ def test_stance_symmetry_is_charged_in_double_support():
     env._foot_contacts = lambda: {"left": True, "right": True}
     _, terms = env._compute_reward()
     assert terms["stance_symmetry_penalty"] < -0.01, "a 20 deg knee skew must be charged"
+
+
+def test_swing_phase_pays_stride_and_clearance():
+    """Jonathan (2026-11-22): motivate long strides and high leg lifts.
+    Both terms pay only in single support, relative to the planted foot,
+    along the body's forward axis — and stay silent in double support."""
+    env = E.MomduckWalkEnv(actuator_force="xml", seed=5, max_episode_s=20.0)
+    env.reset(seed=5)
+    for _ in range(200):
+        env.step(np.zeros(14, dtype=np.float32))
+    _, terms = env._compute_reward()
+    assert terms["stride_length"] == 0.0
+    assert terms["foot_clearance"] == 0.0
+
+    # Planted single support: right foot 8 cm along the BODY-forward axis
+    # AHEAD OF THE TRUNK (v5 measures stride against the trunk projection;
+    # spawn yaw is randomised) and lifted 5 cm over the planted sole.
+    env._foot_contacts = lambda: {"left": True, "right": False}
+    pst = env.data.geom_xpos[env.foot_geoms["left"]].copy()
+    f = env._trunk_xmat.reshape(3, 3) @ env.BODY_FORWARD
+    trunk = env._trunk_xpos[:2].copy()
+    env.data.geom_xpos[env.foot_geoms["right"]][:2] = trunk + 0.08 * f[:2]
+    env.data.geom_xpos[env.foot_geoms["right"]][2] = pst[2] + 0.05
+    _, terms = env._compute_reward()
+    assert terms["stride_length"] > 1.0, "an 8 cm lead must pay"
+    assert terms["foot_clearance"] > 1.0, "a 5 cm lift must pay"
+
+
+def test_hip_roll_symmetry_has_its_own_charge():
+    """Dedicated hip_roll symmetry charge (Jonathan: "нужна симметрия
+    hip roll") on top of the generic stance term — same double-support
+    gate, mirror sign -1 (symmetric stance: rel_left == -rel_right)."""
+    env = E.MomduckWalkEnv(actuator_force="xml", seed=5, max_episode_s=20.0)
+    env.reset(seed=5)
+    for _ in range(200):
+        env.step(np.zeros(14, dtype=np.float32))
+    _, terms = env._compute_reward()
+    assert abs(terms["hip_roll_symmetry_penalty"]) < 1e-5
+    il, _, _ = env._hip_roll_pair
+    adr = int(env.model.joint("left_hip_roll").qposadr[0])
+    env.data.qpos[adr] += np.deg2rad(8.0)
+    import mujoco
+    mujoco.mj_forward(env.model, env.data)
+    env._foot_contacts = lambda: {"left": True, "right": True}
+    _, terms = env._compute_reward()
+    assert terms["hip_roll_symmetry_penalty"] < -0.005, "an 8 deg hip_roll skew must be charged"
+
+
+def test_hip_yaw_symmetry_has_its_own_charge():
+    """Dedicated hip_yaw symmetry charge (Jonathan: "есть явная асимметрия
+    hip yaw") — measured on e75952 in double support: both sides ~-9 deg
+    where symmetry needs rel_left == -rel_right, i.e. an 18 deg skew.
+    Same double-support gate, mirror sign -1, as the hip_roll charge."""
+    env = E.MomduckWalkEnv(actuator_force="xml", seed=5, max_episode_s=20.0)
+    env.reset(seed=5)
+    for _ in range(200):
+        env.step(np.zeros(14, dtype=np.float32))
+    _, terms = env._compute_reward()
+    assert abs(terms["hip_yaw_symmetry_penalty"]) < 1e-5
+    iy, _, _ = env._hip_yaw_pair
+    adr = int(env.model.joint("left_hip_yaw").qposadr[0])
+    # A pure yaw deflection of ONE side by 9 deg; symmetric counterpart
+    # would be +9 deg on the other side, so this is an 18 deg skew.
+    env.data.qpos[adr] += np.deg2rad(9.0)
+    import mujoco
+    mujoco.mj_forward(env.model, env.data)
+    env._foot_contacts = lambda: {"left": True, "right": True}
+    _, terms = env._compute_reward()
+    assert terms["hip_yaw_symmetry_penalty"] < -0.005, "a one-sided 9 deg hip_yaw deflection must be charged"
+
+
+def test_path_drift_is_charged_under_forward_command():
+    """Path-straightness charge (Jonathan: "проблема с прямолинейностью" at
+    0.25 m/s — measured heading RMSE ~110 deg, lateral RMS 0.144 m/s on
+    e75952@15394k). Quadratic on body-frame lateral velocity and yaw-rate
+    error; zero without a motion command."""
+    env = E.MomduckWalkEnv(actuator_force="xml", seed=5, max_episode_s=20.0)
+    env.reset(seed=5)
+    for _ in range(200):
+        env.step(np.zeros(14, dtype=np.float32))
+    env.twist_cmd[:] = (0.25, 0.0, 0.0)
+    _, terms = env._compute_reward()
+    assert abs(terms["path_drift_penalty"]) < 1e-3
+    env.body_lin_vel = lambda: np.array([0.25, 0.1, 0.0])
+    _, terms = env._compute_reward()
+    assert terms["path_drift_penalty"] < -0.04, "a 0.1 m/s sideways creep must be charged"
+    env.twist_cmd[:] = 0.0
+    env.body_lin_vel = lambda: np.array([0.0, 0.1, 0.0])
+    _, terms = env._compute_reward()
+    assert terms["path_drift_penalty"] == 0.0, "a stand command must not be taxed"
+
+
