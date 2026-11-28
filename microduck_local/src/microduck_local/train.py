@@ -392,7 +392,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                          "default: the contract's keep-alive +-0.05. The gaze poses: -0.75,0.05,-0.05,0.8,-1.4,1.4,-0.015,0.015")
     ap.add_argument("--steps", type=int, default=3_000_000)
     ap.add_argument("--run-name", default=time.strftime("walk-%Y%m%d-%H%M%S"))
-    ap.add_argument("--device", default="cpu", choices=("cpu", "mps"))
+    ap.add_argument("--device", default="cpu", choices=("cpu", "mps", "cuda"))
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--init-from", default=None,
                     help="warm-start from an existing run dir (fine-tune)")

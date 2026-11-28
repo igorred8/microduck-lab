@@ -64,7 +64,7 @@ class MomduckWalkEnv(MicroduckWalkEnv):
     STRIDE_TARGET = 0.10       # m the swing foot lands AHEAD of the trunk
     W_CLEARANCE = 3.0
     CLEARANCE_TARGET = 0.04    # m of swing-foot lift over the stance sole
-    W_FORWARD_PROGRESS = 6.0
+    W_FORWARD_PROGRESS = 8.0
     #: Dedicated hip_roll symmetry charge (Jonathan, 2026-11-22: "нужна
     #: симметрия hip roll"). The generic stance_symmetry term covers the pair
     #: at W4 among all five; hip_roll is the one the eye catches (measured
@@ -81,6 +81,27 @@ class MomduckWalkEnv(MicroduckWalkEnv):
     #: and a ~0.4 % charge cannot pull it out. 24x the quadratic still prices
     #: only ~-90, about 1.5 % of the economy.
     W_HIP_YAW_SYM = 24.0
+    #: Heel-strike charge (Jonathan, 2026-11-24: "левую ногу часто ставит на
+    #: пятку"). Measured at contact: left 32 % vs right 11 % heel-first landings
+    #: with near-identical ankle angles — it is the sole's approach orientation,
+    #: not a joint-limit problem. Charged only on NEW contacts (a planted sole
+    #: is not taxed), when the sole normal tips backward past HEEL_STRIKE_TOL.
+    W_HEEL_STRIKE = 1.0
+    HEEL_STRIKE_TOL = 0.1
+    #: Half-period gait mirror (Jonathan, 2026-11-24: "махи левой ноги,
+    #: положение тела и головы должны быть симметричны с махами правой").
+    #: At every step the pose is compared with the MIRRORED pose from
+    #: MIRROR_LAG_STEPS ago, so a left swing is charged to match the right
+    #: swing — legs AND trunk/head, since all 14 joints are compared.
+    W_MIRROR_LAG = 1.0
+    MIRROR_LAG_STEPS = 40  # 0.8 s at 50 Hz — the measured shuffle period
+    #: Speed-stability charge (Jonathan, 2026-11-24: "добавим награду за
+    #: стабильность скорости"). Variance of forward body velocity over the
+    #: last 0.5 s, gated on actually moving (|mean vx| > 2 cm/s) so standing
+    #: still cannot earn stability points — only a moving gait is judged.
+    W_SPEED_STABILITY = 1.0
+    SPEED_STABILITY_WINDOW = 25  # 0.5 s at 50 Hz
+    SPEED_STABILITY_MIN_SPEED = 0.02  # m/s
     #: Path-straightness charge (Jonathan, 2026-11-22: e75952@15394k reaches
     #: 0.25 m/s "но есть проблема с прямолинейностью"). The track_lin_vel
     #: Gaussian has TRACK_STD2=0.1 — dead to a systematic 0.1 m/s sideways
@@ -136,6 +157,30 @@ class MomduckWalkEnv(MicroduckWalkEnv):
         # Same by-name resolution for the hip_yaw pair (indices 0 and 9).
         _iy = _names.index("left_hip_yaw")
         self._hip_yaw_pair = (_iy, int(_p[_iy]), float(_s[_iy]))
+        self._prev_foot_contacts = {"left": False, "right": False}
+        self._sole_normal_local = {}
+        from collections import deque
+        self._mirror_hist = deque(maxlen=self.MIRROR_LAG_STEPS + 1)
+        from collections import deque as _deque
+        self._vx_hist = _deque(maxlen=self.SPEED_STABILITY_WINDOW)
+
+    def reset(self, *, seed=None, options=None):
+        obs, info = super().reset(seed=seed, options=options)
+        self._prev_foot_contacts = {"left": False, "right": False}
+        self._mirror_hist.clear()
+        self._vx_hist.clear()
+
+    def reset(self, *, seed=None, options=None):
+        obs, info = super().reset(seed=seed, options=options)
+        self._prev_foot_contacts = {"left": False, "right": False}
+        # Sole normal is world +Z at STAND (flat sole). Store the LOCAL vector
+        # that produces it, per foot — a collision box's local +z is NOT the
+        # sole normal (measured: left ~horizontal, right ~down at STAND).
+        for side, gid in self.foot_geoms.items():
+            self._sole_normal_local[side] = (
+                self.data.geom_xmat[gid].reshape(3, 3).T
+                @ np.array([0.0, 0.0, 1.0]))
+        return obs, info
 
     def _compute_reward(self):
         reward, terms = super()._compute_reward()
@@ -187,6 +232,35 @@ class MomduckWalkEnv(MicroduckWalkEnv):
         # ground (stride) and lifting (clearance), relative to the planted
         # foot, along the body's forward axis.
         contacts = self._foot_contacts()
+        heel = 0.0
+        for side, gid in self.foot_geoms.items():
+            now = bool(contacts[side])
+            if now and not self._prev_foot_contacts[side]:
+                normal = (self.data.geom_xmat[gid].reshape(3, 3)
+                          @ self._sole_normal_local[side])
+                heel += max(0.0, -float(normal[0]) - self.HEEL_STRIKE_TOL)
+            self._prev_foot_contacts[side] = now
+        terms["heel_strike_penalty"] = -self.W_HEEL_STRIKE * heel
+        reward += terms["heel_strike_penalty"]
+        # Half-period mirror: pose now vs the MIRRORED pose MIRROR_LAG_STEPS ago.
+        from .momduck_symmetry import momduck_mirror_action
+        rel = self._joint_pos_rel()
+        self._mirror_hist.append(rel.copy())
+        if len(self._mirror_hist) > self.MIRROR_LAG_STEPS:
+            old = self._mirror_hist.popleft()
+            diff = rel - momduck_mirror_action(old)
+            terms["mirror_lag_penalty"] = -self.W_MIRROR_LAG * float(diff @ diff)
+            reward += terms["mirror_lag_penalty"]
+        # Speed stability: variance of forward body velocity over the last 0.5 s.
+        v = self.body_lin_vel()
+        self._vx_hist.append(float(v[0]))
+        if len(self._vx_hist) >= self.SPEED_STABILITY_WINDOW:
+            arr = np.asarray(self._vx_hist)
+            if abs(float(arr.mean())) > self.SPEED_STABILITY_MIN_SPEED:
+                terms["speed_stability_penalty"] = -self.W_SPEED_STABILITY * float(arr.var())
+                reward += terms["speed_stability_penalty"]
+            else:
+                terms["speed_stability_penalty"] = 0.0
         if contacts["left"] and contacts["right"]:
             rel = self._joint_pos_rel()
             skew = 0.0

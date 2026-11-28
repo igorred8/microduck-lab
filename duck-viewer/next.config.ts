@@ -7,7 +7,7 @@ const nextConfig: NextConfig = {
   // bails out to client rendering, and paints black with three 403s and no
   // explanation on screen. Both spellings of this machine are the same
   // machine; say so.
-  allowedDevOrigins: ["127.0.0.1", "localhost"],
+  allowedDevOrigins: ["127.0.0.1", "localhost", "172.30.188.143"],
 };
 
 export default nextConfig;

@@ -17,7 +17,8 @@ from microduck_local.robots.momduck_curriculum import MomduckRunCurriculum
 def test_momduck_suggestion_matches_the_momduck_recipe(monkeypatch):
     suggestions = lab_robots.teach_suggestions("momduck")
     assert [s["behavior"] for s in suggestions] == [
-        "momduck_stand", "momduck_forward", "momduck_walk", "momduck_run"]
+        "momduck_stand", "momduck_forward", "momduck_walk", "momduck_walk_bam",
+        "momduck_run"]
     monkeypatch.setattr(lab_robots, "available_robots", lambda: [{
         "id": "momduck", "label": "Momduck", "noun": "momduck",
         "kind": "legged", "ready": True, "animate": True,

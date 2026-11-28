@@ -95,7 +95,14 @@ class OnnxWalkPolicy(torch.nn.Module):
             self.hip_yaw_limit = HIP_YAW_TARGET_LIMIT_RAD
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        x = torch.clamp((obs - self.obs_mean) / self.obs_std, -self.clip_obs, self.clip_obs)
+        # Export may run from a trainer whose policy is on CUDA while the obs
+        # and the normalizer buffers are on CPU — put everything on the
+        # policy's device instead of assuming CPU.
+        device = getattr(self.policy, "device", None) or self.obs_mean.device
+        obs = obs.to(device)
+        obs_mean = self.obs_mean.to(device)
+        obs_std = self.obs_std.to(device)
+        x = torch.clamp((obs - obs_mean) / obs_std, -self.clip_obs, self.clip_obs)
         features = self.policy.extract_features(x, self.policy.features_extractor)
         latent_pi = self.policy.mlp_extractor.forward_actor(features)
         action = self.policy.action_net(latent_pi)  # deterministic mean action
@@ -103,7 +110,7 @@ class OnnxWalkPolicy(torch.nn.Module):
             # Same idempotent bound as MomduckBody.process_action(). Reapplying
             # it in the walking env is therefore exact, not a second scaling.
             action = torch.where(
-                self.hip_yaw_mask,
+                self.hip_yaw_mask.to(device),
                 torch.clamp(action, -self.hip_yaw_limit, self.hip_yaw_limit),
                 action,
             )

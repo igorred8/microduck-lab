@@ -652,7 +652,7 @@ class MicroduckWalkEnv(gym.Env):
             # were. The env-level 0/1-ctrl-step action lag is switched OFF under
             # BAM: the actuator models the real 3-6 physics-step bus lag itself,
             # and stacking both would double-count it.
-            self.bam = BamXL330Actuator(
+            self.bam = getattr(type(self), "BAM_ACTUATOR_CLS", BamXL330Actuator)(
                 self.model, self.data, self.robot.joint_names,
                 dt=C.PHYSICS_DT,
                 rng=np.random.default_rng(seed),

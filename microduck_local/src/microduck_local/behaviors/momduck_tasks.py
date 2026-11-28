@@ -4,6 +4,8 @@ The rewards live in ``robots/momduck_env``. The terms below are the
 environment-owned scorecards shown by the viewer, not second implementations.
 """
 
+from dataclasses import replace
+
 from .core import *  # noqa: F401,F403 — the package's namespace cascade
 from .core import Behavior, CurriculumStage, RewardTerm
 
@@ -266,6 +268,37 @@ MOMDUCK_WALK = Behavior(
 )
 
 _register(MOMDUCK_WALK)
+
+
+MOMDUCK_WALK_BAM = replace(
+    MOMDUCK_WALK,
+    id="momduck_walk_bam",
+    suggest="walk with BAM STS3215",
+    title="Walk with BAM STS3215 (Momduck)",
+    keywords=("walk with bam", "bam walk", "sts3215 walk", "bam"),
+    description=(
+        "Same original velocity-command walk as momduck_walk, but with the real "
+        "STS3215 BAM actuator instead of the simplified XML position actuators. "
+        "For fine-tuning alpha_walking.onnx on Momduck's actual servo physics."
+    ),
+    how_it_learns=(
+        "Identical command mixture, pushes, domain randomisation, observation "
+        "noise and action delay to momduck_walk; only the actuator changes: "
+        "BAM STS3215 m1 with kp_fw=32, error_gain=0.166, vin 7.0-8.2 V and "
+        "the firmware rate limiter."
+    ),
+    trainer=(
+        "-m", "microduck_local.train",
+        "--robot", "momduck", "--task", "walk", "--actuator", "bam", "--lr", "5e-5",
+        "--device", "cuda",
+    ),
+    curriculum=(CurriculumStage(
+        "original velocity-command walk with BAM STS3215", 3_000_000,
+        {"MICRODUCK_ACTUATOR": "bam"},
+        detail="Same recipe as momduck_walk, but with the real servo model.",
+    ),),
+)
+_register(MOMDUCK_WALK_BAM)
 
 
 MOMDUCK_RUN = Behavior(

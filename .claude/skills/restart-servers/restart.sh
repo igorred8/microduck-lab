@@ -386,8 +386,8 @@ for i in $(seq 1 40); do
 done
 if [ "${ok:-0}" != 1 ]; then
   if grep -q "no ducks" "$LOG" 2>/dev/null; then
-    echo "empty roster — retrying with the default walker..."
-    MICRODUCK_ACTUATOR=bam detach "$LOG" uv run --directory "$ML" "$ENTRY" --port "$PORT" ../microduck/policies/alpha_walking.onnx
+    echo "empty roster — retrying with the original duck standing..."
+    MICRODUCK_ACTUATOR=bam detach "$LOG" uv run --directory "$ML" "$ENTRY" --port "$PORT" ../microduck/policies/alpha_stand.onnx
     for i in $(seq 1 40); do
       sleep 2
       curl -s -m 2 "http://127.0.0.1:$PORT/joints" >/dev/null 2>&1 && { echo "backend UP on :$PORT"; ok=1; break; }

@@ -4459,6 +4459,7 @@ def convert_capture(src: Path, base: str) -> dict:
 # ?lab=host:port). Non-browser clients — curl, the CLI, the tests — send no
 # Origin at all; that is not a forgeable state, so it passes.
 LOCAL_ORIGIN_RE = re.compile(r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$")
+EXTRA_BROWSER_ORIGIN = os.environ.get("MICRODUCK_LAB_ORIGIN")
 
 # CORS-safelisted request content types. A cross-origin POST carrying one of
 # these is a "simple" request: the browser dispatches it with NO preflight, so
@@ -4481,7 +4482,8 @@ def origin_allowed(origin: str | None) -> bool:
     so `.match()` here accepted "http://localhost\\n" where the middleware
     refused it. One pattern, two verdicts — the drift the shared constant
     was meant to prevent, hiding in the call instead of the regex."""
-    return origin is None or bool(LOCAL_ORIGIN_RE.fullmatch(origin))
+    return (origin is None or origin == EXTRA_BROWSER_ORIGIN
+            or bool(LOCAL_ORIGIN_RE.fullmatch(origin)))
 
 
 def make_app(ducks: list[Duck], idle_exit_s: float = 0.0):
@@ -4582,6 +4584,7 @@ def make_app(ducks: list[Duck], idle_exit_s: float = 0.0):
         # enforce the same rule outside CORS, and a second literal here would
         # let the two drift apart on the next port-scheme change.
         allow_origin_regex=LOCAL_ORIGIN_RE.pattern,
+        allow_origins=([EXTRA_BROWSER_ORIGIN] if EXTRA_BROWSER_ORIGIN else []),
         allow_methods=["*"], allow_headers=["*"])
 
     # World mode (the /sim page): its own World, routes and /ws/sim socket —
@@ -6217,7 +6220,8 @@ def main() -> None:
     app = make_app(ducks, idle_exit_s=60.0 * idle_min)
     if args.world:
         app.state.world.preload(args.world)
-    uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
+    uvicorn.run(app, host=os.environ.get("MICRODUCK_LAB_HOST", "127.0.0.1"),
+                port=args.port, log_level="warning")
 
 
 if __name__ == "__main__":
